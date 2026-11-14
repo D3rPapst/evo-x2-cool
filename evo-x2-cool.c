@@ -355,6 +355,17 @@ static void WINAPI etw_ereignis(PEVENT_RECORD e)
             if (n % 2 == 0) bestaetigt = 1;   // only a full period confirms (a half one can match by chance)
         } else {
             art = ABFRAGE_AUSSER;
+            // another period than the start value (the .56 runs at 10.134 s, the .198 at 10.066 s; 68 ms a period is more
+            // than the raster, so the learning above never got a query on the beat): three queries in a row one period
+            // apart (9.5-10.8 s, the two gaps within 5 ms of each other) set the period and the reference directly
+            LONG64 p1 = frueher[(frueherNr + 7) % 8], p2 = frueher[(frueherNr + 6) % 8];
+            if (p1 && p2) {
+                LONG64 d1 = t - p1, d0 = p1 - p2, lo = f * 9500 / 1000, hi = f * 10800 / 1000;
+                if (d0 > lo && d0 < hi && d1 > lo && d1 < hi && _abs64(d1 - d0) < f / 200) {
+                    InterlockedExchange64(&acpiTakt, (d0 + d1) / 2); InterlockedExchange64(&acpiQpc, t);
+                    art = ABFRAGE_NEU; bestaetigt = 1;
+                }
+            }
             for (int i = 0; i < 8 && !bestaetigt; i++) {
                 LONG64 dd = t - frueher[i], nn = (dd + halb / 2) / halb, rr = dd - nn * halb;
                 if (frueher[i] && frueher[i] != alt && (nn == 2 || nn == 4) && rr < raster && -rr < raster) {
