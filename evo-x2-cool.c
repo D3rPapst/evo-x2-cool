@@ -1190,8 +1190,12 @@ static void messen(Regler *r, Messung *m)
         if (v < 0 && !wmiOk) v = ec_read_sicher(REG_TEMP, r->ec[0]);
         if (v >= 0 && v <= 110) r->ec[0] = v;
     }
-    if (wmiOk && k % 30 == 1 && !ec_ruhig()) {
+    // CPU fans every 30 s; a read that falls into the quiet time after a curve write is made up in the first second after
+    // it (under changing load the writes come every few seconds and a fixed second skipped the read for minutes)
+    static long long rpmZuletzt = -30;
+    if (wmiOk && k - rpmZuletzt >= 30 && !ec_ruhig()) {
         int rpm[2];
+        rpmZuletzt = k;
         if (wmi_rpm(rpm)) { r->ec[1] = rpm[0] >> 8; r->ec[2] = rpm[0] & 0xFF; r->ec[3] = rpm[1] >> 8; r->ec[4] = rpm[1] & 0xFF; }
     }
     static const uint8_t sek[9] = { 1, 2, 3, 4, 6, 7, 8, 9, 11 }, regs[3] = { REG_L1, REG_L2, REG_SYS };
