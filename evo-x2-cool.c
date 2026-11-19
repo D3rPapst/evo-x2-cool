@@ -56,6 +56,7 @@
 static float ziel; static int minP, minLeer, maxP, spitze, achtung, alarm, sicherMhz, taktPlus, nurLesen, ohneEc;
 static int minDauer, dauerW;   // fan floor under lasting high load (0 = off), and from how many watts
 static int sprungW, sprungP;   // power jump within 2 s that sends the fan straight to sprungP % (0 = off)
+static int sysLesen;           // read the system fan speed directly (see the table)
 static const struct { const wchar_t *key; int *var, def, lo, hi, imFile; } settings[] = {
     { L"MinProzent", &minP, 30, 0, 100, 1 },
     { L"MinLeerlauf", &minLeer, 15, 0, 100, 1 },   // lower floor while idle and far below the target
@@ -69,6 +70,10 @@ static const struct { const wchar_t *key; int *var, def, lo, hi, imFile; } setti
     { L"SprungW", &sprungW, 50, 0, 150, 1 },
     { L"SprungProzent", &sprungP, 50, 30, 100, 1 },
     { L"TaktPlus", &taktPlus, 0, -600, 600, 0 },   // test switch: MHz added to every clock cap
+    // switch: read the system fan speed (0x28/0x29) directly from the EC. Off by default since 0.8.4: on the .56 two ACPI 13
+    // came exactly 5.0 s after a slow direct read of 0x29 (41.7 / 95.9 ms instead of ~1.5); the speed is only shown and
+    // logged, not used for control. 1 = read it again (every minute while WMI works, as up to 0.8.3).
+    { L"SystemluefterLesen", &sysLesen, 0, 0, 1, 0 },
 };
 #define ZIEL_DEF 80
 static unsigned fn = F_ALLE;   // functions switched on
@@ -1279,8 +1284,10 @@ static void messen(Regler *r, Messung *m)
     }
     static const uint8_t sek[9] = { 1, 2, 3, 4, 6, 7, 8, 9, 11 }, regs[3] = { REG_L1, REG_L2, REG_SYS };
     static int hoch[3] = { -1, -1, -1 }, tief[3] = { -1, -1, -1 };
+    if (!sysLesen) { r->ec[5] = r->ec[6] = -1; hoch[2] = tief[2] = -1; }   // switched off: no value instead of a stale one
     for (int i = 0; i < 9; i++) {
         if (k % 30 != sek[i] || ec_ruhig()) continue;
+        if (i >= 6 && !sysLesen) continue;
         if (wmiOk && (i < 6 || k % 60 >= 30)) continue;   // CPU fans through WMI; system fan every other cycle
         int l = i / 3, schritt = i % 3;
         if (schritt == 0) { hoch[l] = ec_read(regs[l]); tief[l] = -1; }   // a step skipped in the quiet time leaves -1:
