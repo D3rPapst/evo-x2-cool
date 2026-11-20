@@ -294,6 +294,16 @@ static void ec_ergebnis(int ok)
     }
 }
 
+// quiet time after writes (see EC_RUHE_MS) and after a failed transaction (0.8.5: no quick retries, they hit Windows'
+// pending query again and again); the emergency path does not ask ec_ruhig and still gets through every second
+static ULONGLONG ecRuheBis;
+static void ec_sperre(void) { ULONGLONG b = GetTickCount64() + EC_RUHE_MS; if (b > ecRuheBis) ecRuheBis = b; }
+// 0.8.5: a write can make the EC raise an event of its own that Windows queries at once (ACPI 13 on the .56 20.11.2026
+// 15:10: a single mode write, 5.0 s before the timeout, far from the beat): no read-back in the same transaction, and
+// the next transaction of ours starts EC_NACH_SCHREIBEN_MS after a write at the earliest
+#define EC_NACH_SCHREIBEN_MS 300
+static ULONGLONG ecSchreibEnde;
+
 static int ec_read_raw(uint8_t reg)
 {
     if (!ec_idle()) return -1; pout(EC_SC, EC_RD);
@@ -312,8 +322,10 @@ static int ec_read_raw(uint8_t reg)
 static const GUID ACPI_PROV = { 0xC514638F, 0x7723, 0x485B, { 0xBC, 0xFC, 0x96, 0x56, 0x5D, 0x73, 0x5D, 0x4A } };
 static wchar_t etwName[] = L"EVO-X2-COOL-ACPI";
 #define ACPI_TAKT_MS 10066
-#define ACPI_VOR_MS 40
-#define ACPI_NACH_MS 25
+// 0.8.5: 200/150 instead of 40/25. ACPI-13 traces (18.-20.11.2026) showed the EC busy already 75-145 ms before its beat
+// (our access hung until the beat, then Windows' query timed out) and a write 27-32 ms after the beat hitting as well
+#define ACPI_VOR_MS 200
+#define ACPI_NACH_MS 150
 #define ACPI_ALT_MS 60000
 static volatile LONG64 acpiQpc, acpiTakt;   // QPC time stamp of the last query; learned period in QPC ticks
 static volatile LONG acpiZahl;
@@ -570,6 +582,8 @@ static int wmi_rpm(int r[2])
 static LONG ecSpur;   // trace entry of the transaction holding the mutex (only the control thread touches the EC)
 static int ec_lock(void)
 {
+    ULONGLONG jetzt = GetTickCount64(), frei = ecSchreibEnde + EC_NACH_SCHREIBEN_MS;
+    if (ecSchreibEnde && jetzt < frei) Sleep((DWORD)(frei - jetzt) + 1);
     if (WaitForSingleObject(mEc, 500) > WAIT_ABANDONED) return 0;
     acpi_fenster();
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
@@ -582,11 +596,11 @@ static void ec_frei(void) { spur_ende(ecSpur); ReleaseMutex(mEc); }
 static int ec_read(uint8_t reg)
 {
     if (ohneEc) return -1;
-    for (int t = 0; t < 3; t++) {
-        if (ec_lock()) { spur[ecSpur].reg = reg; int v = ec_read_raw(reg); ec_frei(); if (v >= 0) { ec_ergebnis(1); return v; } }
-        else ecStatus = 0xFF;
-        Sleep(20);
-    }
+    // one try (0.8.5): a failure means the EC or Windows is busy; quick retries hit the same query, so normal reads and
+    // writes pause for the quiet time instead
+    if (ec_lock()) { spur[ecSpur].reg = reg; int v = ec_read_raw(reg); ec_frei(); if (v >= 0) { ec_ergebnis(1); return v; } }
+    else ecStatus = 0xFF;
+    ec_sperre();
     ec_ergebnis(0);
     return -1;
 }
@@ -612,25 +626,23 @@ static int ec_read_geduldig(uint8_t reg)
     return v;
 }
 
-// write with read-back; never in read-only mode
+// write; never in read-only mode. 0.8.5: no read-back in the same transaction (see EC_NACH_SCHREIBEN_MS) and one try;
+// a register whose write failed is marked unknown by the caller and written again after the quiet time, and the
+// periodic check (curve_pruefen, mode read) finds a value the EC did not take
 static int ec_write(uint8_t reg, uint8_t val)
 {
     if (nurLesen) return 0;
-    int gesendet = 0;   // a previous try got as far as sending the value
-    for (int t = 0; t < 5; t++) {
-        if (ec_lock()) {
-            spur[ecSpur].art = SPUR_SCHREIBEN; spur[ecSpur].reg = reg;
-            // a retry may only have lost the read-back (an event right after the write): no second write then
-            if (gesendet && ec_read_raw(reg) == val) { ec_frei(); ec_ergebnis(1); return 1; }
-            int ok = ec_idle(); if (ok) pout(EC_SC, EC_WR);
-            ok = ok && ec_wait(EC_IBF, 0); if (ok) pout(EC_DATA, reg);
-            ok = ok && ec_wait(EC_IBF, 0); if (ok) { pout(EC_DATA, val); gesendet = 1; }
-            ok = ok && ec_wait(EC_IBF, 0) && ec_read_raw(reg) == val;
-            ec_frei();
-            if (ok) { ec_ergebnis(1); return 1; }
-        } else ecStatus = 0xFF;
-        Sleep(20);
-    }
+    if (ec_lock()) {
+        spur[ecSpur].art = SPUR_SCHREIBEN; spur[ecSpur].reg = reg;
+        int ok = ec_idle(); if (ok) pout(EC_SC, EC_WR);
+        ok = ok && ec_wait(EC_IBF, 0); if (ok) pout(EC_DATA, reg);
+        ok = ok && ec_wait(EC_IBF, 0); if (ok) pout(EC_DATA, val);
+        ok = ok && ec_wait(EC_IBF, 0);
+        ec_frei();
+        ecSchreibEnde = GetTickCount64();
+        if (ok) { ec_ergebnis(1); return 1; }
+    } else ecStatus = 0xFF;
+    ec_sperre();
     ec_ergebnis(0);
     return 0;
 }
@@ -1064,7 +1076,6 @@ static double ssd_io(void)
 enum { K_MODUS, K_KONST20, K_START, K_VOLL, K_PWM, K_KONST2 };
 // Curves go out 2 registers a second (emergency, yellow, and the BIOS values at start and stop: all at once), checks 1
 // register a second; the quiet time (EC_RUHE_MS) follows every completed write, also the BIOS values going back.
-static ULONGLONG ecRuheBis;
 static int ec_ruhig(void) { return GetTickCount64() < ecRuheBis; }
 static void ec_ruhe(void) { ecRuheBis = GetTickCount64() + EC_RUHE_MS; }
 
@@ -1699,7 +1710,8 @@ static int run(void)
         save_model();
         int ok = bios_zurueck_jetzt(orig);
         if (fn & F_TAKT) write_cap(sicherMhz);
-        if (r->modusOrig >= 0 && (r->modusJetzt != r->modusOrig || r->modusWill != r->modusOrig)) ec_write(REG_MODUS, (uint8_t)r->modusOrig);
+        if (r->modusOrig >= 0 && (r->modusJetzt != r->modusOrig || r->modusWill != r->modusOrig))   // one try per call
+            for (int t = 0; t < 3 && !ec_write(REG_MODUS, (uint8_t)r->modusOrig); t++) Sleep(EC_HAENGT_MS / 2);   // since 0.8.5
         event(L_("stopp", "Stopp: BIOS-Lüfterkurve %s, Taktbremse bleibt %d MHz, Modell gespeichert"),
               ok ? L_("stopp_ok", "zurück") : L_("stopp_fehler", "NICHT vollständig zurück"), fn & F_TAKT ? sicherMhz : r->capNow);
     } else event(L_("stopp_nurlesen", "Stopp (nur lesen)"));
