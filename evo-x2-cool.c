@@ -56,6 +56,7 @@
 static float ziel; static int minP, minLeer, maxP, spitze, achtung, alarm, sicherMhz, taktPlus, nurLesen, ohneEc;
 static int minDauer, dauerW;   // fan floor under lasting high load (0 = off), and from how many watts
 static int sprungW, sprungP;   // power jump within 2 s that sends the fan straight to sprungP % (0 = off)
+static int sysLesen;           // read the system fan speed directly (see the table)
 static const struct { const wchar_t *key; int *var, def, lo, hi, imFile; } settings[] = {
     { L"MinProzent", &minP, 30, 0, 100, 1 },
     { L"MinLeerlauf", &minLeer, 15, 0, 100, 1 },   // lower floor while idle and far below the target
@@ -69,6 +70,10 @@ static const struct { const wchar_t *key; int *var, def, lo, hi, imFile; } setti
     { L"SprungW", &sprungW, 50, 0, 150, 1 },
     { L"SprungProzent", &sprungP, 50, 30, 100, 1 },
     { L"TaktPlus", &taktPlus, 0, -600, 600, 0 },   // test switch: MHz added to every clock cap
+    // switch: read the system fan speed (0x28/0x29) directly from the EC. Off by default since 0.8.4: on the .56 two ACPI 13
+    // came exactly 5.0 s after a slow direct read of 0x29 (41.7 / 95.9 ms instead of ~1.5); the speed is only shown and
+    // logged, not used for control. 1 = read it again (every minute while WMI works, as up to 0.8.3).
+    { L"SystemluefterLesen", &sysLesen, 0, 0, 1, 0 },
 };
 #define ZIEL_DEF 80
 static unsigned fn = F_ALLE;   // functions switched on
@@ -289,6 +294,16 @@ static void ec_ergebnis(int ok)
     }
 }
 
+// quiet time after writes (see EC_RUHE_MS) and after a failed transaction (0.8.5: no quick retries, they hit Windows'
+// pending query again and again); the emergency path does not ask ec_ruhig and still gets through every second
+static ULONGLONG ecRuheBis;
+static void ec_sperre(void) { ULONGLONG b = GetTickCount64() + EC_RUHE_MS; if (b > ecRuheBis) ecRuheBis = b; }
+// 0.8.5: a write can make the EC raise an event of its own that Windows queries at once (ACPI 13 on the .56 20.11.2026
+// 15:10: a single mode write, 5.0 s before the timeout, far from the beat): no read-back in the same transaction, and
+// the next transaction of ours starts EC_NACH_SCHREIBEN_MS after a write at the earliest
+#define EC_NACH_SCHREIBEN_MS 300
+static ULONGLONG ecSchreibEnde;
+
 static int ec_read_raw(uint8_t reg)
 {
     if (!ec_idle()) return -1; pout(EC_SC, EC_RD);
@@ -307,8 +322,10 @@ static int ec_read_raw(uint8_t reg)
 static const GUID ACPI_PROV = { 0xC514638F, 0x7723, 0x485B, { 0xBC, 0xFC, 0x96, 0x56, 0x5D, 0x73, 0x5D, 0x4A } };
 static wchar_t etwName[] = L"EVO-X2-COOL-ACPI";
 #define ACPI_TAKT_MS 10066
-#define ACPI_VOR_MS 40
-#define ACPI_NACH_MS 25
+// 0.8.5: 200/150 instead of 40/25. ACPI-13 traces (18.-20.11.2026) showed the EC busy already 75-145 ms before its beat
+// (our access hung until the beat, then Windows' query timed out) and a write 27-32 ms after the beat hitting as well
+#define ACPI_VOR_MS 200
+#define ACPI_NACH_MS 150
 #define ACPI_ALT_MS 60000
 static volatile LONG64 acpiQpc, acpiTakt;   // QPC time stamp of the last query; learned period in QPC ticks
 static volatile LONG acpiZahl;
@@ -328,6 +345,20 @@ static Abfrage abfragen[32]; static volatile LONG abfrageNr; static LONG abfrage
 // our own WMI reads (wmi_lesen) also show up as Windows EC accesses: their time spans (QPC) mark them as our own, they
 // neither move the reference nor count as off the beat
 static volatile LONG64 wmiVon[16], wmiBis[16]; static volatile LONG wmiNr;
+// ACPI-13 trace: every EC access of ours (direct read/write with start and end, BIOS WMI call) and every Windows query
+// seen through ETW goes into a ring with QPC times. When an ACPI 13 shows up, the 30 s before it are written to
+// acpi13-<date>.txt, so it shows whether one of our accesses ran at the moment Windows timed out (a query that times out
+// may not reach ETW at all, so the diagnosis above cannot see it).
+enum { SPUR_LESEN = 1, SPUR_SCHREIBEN, SPUR_WMI, SPUR_WIN };
+typedef struct { LONG64 von, bis; uint8_t art, reg; } Spur;
+static Spur spur[1024]; static volatile LONG spurNr;
+static LONG spur_neu(int art, int reg, LONG64 von, LONG64 bis)
+{
+    LONG i = InterlockedIncrement(&spurNr) % 1024;
+    spur[i].von = 0; spur[i].art = (uint8_t)art; spur[i].reg = (uint8_t)reg; spur[i].bis = bis; spur[i].von = von;
+    return i;
+}
+static void spur_ende(LONG i) { LARGE_INTEGER t; QueryPerformanceCounter(&t); spur[i].bis = t.QuadPart; }
 
 static void WINAPI etw_ereignis(PEVENT_RECORD e)
 {
@@ -336,6 +367,7 @@ static void WINAPI etw_ereignis(PEVENT_RECORD e)
     LONG64 t = e->EventHeader.TimeStamp.QuadPart, f = qpcHz.QuadPart, alt = acpiQpc;
     if (letzte && t - letzte < f / 10) return;   // one query brings several events within a millisecond
     letzte = t;
+    spur_neu(SPUR_WIN, 0, t, t);
     // the reference moves only with queries on the beat: one off the beat (the EC's own events) would otherwise shift the
     // predicted windows away from the next regular query for up to 10 s. A reference not yet confirmed by a query on the
     // beat after it (the first one seen may be off the beat) is replaced as soon as two queries lie one or two periods
@@ -499,8 +531,9 @@ static long long wmi_lesen(const wchar_t *method, const wchar_t *in1, int v1, co
     LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
     LONG nr = InterlockedIncrement(&wmiNr) % 16;
     wmiBis[nr] = LLONG_MAX; wmiVon[nr] = t0.QuadPart;   // open span while the call runs
+    LONG sp = spur_neu(SPUR_WMI, method[3] == 'H' ? 1 : 2, t0.QuadPart, 0);
     HRESULT hr = IWbemServices_ExecMethod(wSvc, wPath, m, 0, 0, in, &res, 0);
-    QueryPerformanceCounter(&t1); wmiBis[nr] = t1.QuadPart;
+    QueryPerformanceCounter(&t1); wmiBis[nr] = t1.QuadPart; spur[sp].bis = t1.QuadPart;
     if (SUCCEEDED(hr) && res) {
         VariantInit(&v);
         if (SUCCEEDED(IWbemClassObject_Get(res, out, 0, &v, 0, 0)))
@@ -546,23 +579,28 @@ static int wmi_rpm(int r[2])
 
 // the window is checked while the mutex is held: another EC program (LibreHardwareMonitor ...) holding it up to 500 ms
 // would otherwise move our transaction into the query; it waits at most the window length, as during its own accesses
+static LONG ecSpur;   // trace entry of the transaction holding the mutex (only the control thread touches the EC)
 static int ec_lock(void)
 {
+    ULONGLONG jetzt = GetTickCount64(), frei = ecSchreibEnde + EC_NACH_SCHREIBEN_MS;
+    if (ecSchreibEnde && jetzt < frei) Sleep((DWORD)(frei - jetzt) + 1);
     if (WaitForSingleObject(mEc, 500) > WAIT_ABANDONED) return 0;
     acpi_fenster();
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     zugriffe[InterlockedIncrement(&zugriffNr) % 64] = t.QuadPart;
+    ecSpur = spur_neu(SPUR_LESEN, 0, t.QuadPart, 0);
     return 1;
 }
+static void ec_frei(void) { spur_ende(ecSpur); ReleaseMutex(mEc); }
 
 static int ec_read(uint8_t reg)
 {
     if (ohneEc) return -1;
-    for (int t = 0; t < 3; t++) {
-        if (ec_lock()) { int v = ec_read_raw(reg); ReleaseMutex(mEc); if (v >= 0) { ec_ergebnis(1); return v; } }
-        else ecStatus = 0xFF;
-        Sleep(20);
-    }
+    // one try (0.8.5): a failure means the EC or Windows is busy; quick retries hit the same query, so normal reads and
+    // writes pause for the quiet time instead
+    if (ec_lock()) { spur[ecSpur].reg = reg; int v = ec_read_raw(reg); ec_frei(); if (v >= 0) { ec_ergebnis(1); return v; } }
+    else ecStatus = 0xFF;
+    ec_sperre();
     ec_ergebnis(0);
     return -1;
 }
@@ -588,24 +626,23 @@ static int ec_read_geduldig(uint8_t reg)
     return v;
 }
 
-// write with read-back; never in read-only mode
+// write; never in read-only mode. 0.8.5: no read-back in the same transaction (see EC_NACH_SCHREIBEN_MS) and one try;
+// a register whose write failed is marked unknown by the caller and written again after the quiet time, and the
+// periodic check (curve_pruefen, mode read) finds a value the EC did not take
 static int ec_write(uint8_t reg, uint8_t val)
 {
     if (nurLesen) return 0;
-    int gesendet = 0;   // a previous try got as far as sending the value
-    for (int t = 0; t < 5; t++) {
-        if (ec_lock()) {
-            // a retry may only have lost the read-back (an event right after the write): no second write then
-            if (gesendet && ec_read_raw(reg) == val) { ReleaseMutex(mEc); ec_ergebnis(1); return 1; }
-            int ok = ec_idle(); if (ok) pout(EC_SC, EC_WR);
-            ok = ok && ec_wait(EC_IBF, 0); if (ok) pout(EC_DATA, reg);
-            ok = ok && ec_wait(EC_IBF, 0); if (ok) { pout(EC_DATA, val); gesendet = 1; }
-            ok = ok && ec_wait(EC_IBF, 0) && ec_read_raw(reg) == val;
-            ReleaseMutex(mEc);
-            if (ok) { ec_ergebnis(1); return 1; }
-        } else ecStatus = 0xFF;
-        Sleep(20);
-    }
+    if (ec_lock()) {
+        spur[ecSpur].art = SPUR_SCHREIBEN; spur[ecSpur].reg = reg;
+        int ok = ec_idle(); if (ok) pout(EC_SC, EC_WR);
+        ok = ok && ec_wait(EC_IBF, 0); if (ok) pout(EC_DATA, reg);
+        ok = ok && ec_wait(EC_IBF, 0); if (ok) pout(EC_DATA, val);
+        ok = ok && ec_wait(EC_IBF, 0);
+        ec_frei();
+        ecSchreibEnde = GetTickCount64();
+        if (ok) { ec_ergebnis(1); return 1; }
+    } else ecStatus = 0xFF;
+    ec_sperre();
     ec_ergebnis(0);
     return 0;
 }
@@ -703,6 +740,47 @@ static void event2(int wichtig, const char *fmt, ...)
     if (GetConsoleWindow()) printf("\n%s", line);
 }
 
+static int spur_vergleich(const void *a, const void *b)
+{
+    LONG64 x = ((const Spur *)a)->von, y = ((const Spur *)b)->von;
+    return x < y ? -1 : x > y;
+}
+// the trace around an ACPI 13 (ft = its time, UTC FILETIME): all entries from 30 s before to 2 s after into
+// acpi13-<date>.txt; returns the gap of our nearest own access (start..end against the moment) in ms, 1e9 if none
+static float spur_schreiben(ULONGLONG ft, const SYSTEMTIME *st, int *zahlWin, int *artNah)
+{
+    static Spur kopie[1024];
+    LARGE_INTEGER q; FILETIME jetzt; QueryPerformanceCounter(&q); GetSystemTimePreciseAsFileTime(&jetzt);
+    LONG64 f = qpcHz.QuadPart, nowFt = (LONG64)((ULONGLONG)jetzt.dwHighDateTime << 32 | jetzt.dwLowDateTime);
+    LONG64 tq = q.QuadPart - (nowFt - (LONG64)ft) * f / 10000000;   // the ACPI 13 moment in QPC ticks
+    int n = 0;
+    for (int i = 0; i < 1024; i++) {
+        Spur e = spur[i];
+        if (e.von && e.von >= tq - 30 * f && e.von <= tq + 2 * f) kopie[n++] = e;
+    }
+    qsort(kopie, n, sizeof *kopie, spur_vergleich);
+    static const char *name[] = { "?", "EC lesen", "EC schreiben", "WMI", "Windows-Abfrage" };
+    char zeile[160]; wchar_t datei[40];
+    _snwprintf(datei, 40, L"acpi13-%04d-%02d-%02d.txt", st->wYear, st->wMonth, st->wDay);
+    snprintf(zeile, sizeof zeile, "\r\n=== ACPI 13 um %02d:%02d:%02d.%03d, %d Einträge (Zeit relativ, ms) ===\r\n",
+             st->wHour, st->wMinute, st->wSecond, st->wMilliseconds, n);
+    append(datei, zeile);
+    float nah = 1e9f; *zahlWin = 0; *artNah = 0;
+    for (int i = 0; i < n; i++) {
+        Spur *e = &kopie[i];
+        float von = (float)(e->von - tq) * 1000 / f, bis = e->bis ? (float)(e->bis - tq) * 1000 / f : von;
+        if (e->art == SPUR_WIN) (*zahlWin)++;
+        else {
+            float abst = von <= 0 && bis >= 0 ? 0 : fminf(fabsf(von), fabsf(bis));
+            if (abst < nah) { nah = abst; *artNah = e->art; }
+        }
+        if (e->art == SPUR_WIN) snprintf(zeile, sizeof zeile, "%+10.1f            %s\r\n", von, name[e->art]);
+        else snprintf(zeile, sizeof zeile, "%+10.1f %7.1f ms  %s 0x%02X\r\n", von, bis - von, name[e->art], e->reg);
+        append(datei, zeile);
+    }
+    return nah;
+}
+
 // Windows' "EC did not respond within the timeout" (ACPI event 13) goes into the event list with its own time, so logs
 // show it next to the controller's EC accesses. Looked up every 30 s in the system log (last 2 min), each event once.
 static void acpi13_pruefen(void)
@@ -724,6 +802,13 @@ static void acpi13_pruefen(void)
                 FILETIME ft = { (DWORD)t, (DWORD)(t >> 32) }, lt; SYSTEMTIME st;
                 FileTimeToLocalFileTime(&ft, &lt); FileTimeToSystemTime(&lt, &st);
                 event(L_("acpi13", "Windows: EC hat nicht geantwortet (ACPI-Ereignis 13) um %02d:%02d:%02d"), st.wHour, st.wMinute, st.wSecond);
+                int win = 0, art = 0;
+                float nah = spur_schreiben(t, &st, &win, &art);
+                static const char *kurz[] = { "-", "EC lesen", "EC schreiben", "WMI", "-" };
+                if (nah < 1e8f) event(L_("acpi13_spur", "ACPI 13 %02d:%02d:%02d.%03d: unser naechster Zugriff %.1f ms entfernt (%s), %d Windows-Abfragen in 30 s; Spur in acpi13-Datei"),
+                                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, nah, kurz[art], win);
+                else event(L_("acpi13_spur0", "ACPI 13 %02d:%02d:%02d.%03d: kein eigener Zugriff in den 30 s davor, %d Windows-Abfragen; Spur in acpi13-Datei"),
+                           st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, win);
             }
             EvtClose(ev[i]);
         }
@@ -991,7 +1076,6 @@ static double ssd_io(void)
 enum { K_MODUS, K_KONST20, K_START, K_VOLL, K_PWM, K_KONST2 };
 // Curves go out 2 registers a second (emergency, yellow, and the BIOS values at start and stop: all at once), checks 1
 // register a second; the quiet time (EC_RUHE_MS) follows every completed write, also the BIOS values going back.
-static ULONGLONG ecRuheBis;
 static int ec_ruhig(void) { return GetTickCount64() < ecRuheBis; }
 static void ec_ruhe(void) { ecRuheBis = GetTickCount64() + EC_RUHE_MS; }
 
@@ -1211,8 +1295,10 @@ static void messen(Regler *r, Messung *m)
     }
     static const uint8_t sek[9] = { 1, 2, 3, 4, 6, 7, 8, 9, 11 }, regs[3] = { REG_L1, REG_L2, REG_SYS };
     static int hoch[3] = { -1, -1, -1 }, tief[3] = { -1, -1, -1 };
+    if (!sysLesen) { r->ec[5] = r->ec[6] = -1; hoch[2] = tief[2] = -1; }   // switched off: no value instead of a stale one
     for (int i = 0; i < 9; i++) {
         if (k % 30 != sek[i] || ec_ruhig()) continue;
+        if (i >= 6 && !sysLesen) continue;
         if (wmiOk && (i < 6 || k % 60 >= 30)) continue;   // CPU fans through WMI; system fan every other cycle
         int l = i / 3, schritt = i % 3;
         if (schritt == 0) { hoch[l] = ec_read(regs[l]); tief[l] = -1; }   // a step skipped in the quiet time leaves -1:
@@ -1624,7 +1710,8 @@ static int run(void)
         save_model();
         int ok = bios_zurueck_jetzt(orig);
         if (fn & F_TAKT) write_cap(sicherMhz);
-        if (r->modusOrig >= 0 && (r->modusJetzt != r->modusOrig || r->modusWill != r->modusOrig)) ec_write(REG_MODUS, (uint8_t)r->modusOrig);
+        if (r->modusOrig >= 0 && (r->modusJetzt != r->modusOrig || r->modusWill != r->modusOrig))   // one try per call
+            for (int t = 0; t < 3 && !ec_write(REG_MODUS, (uint8_t)r->modusOrig); t++) Sleep(EC_HAENGT_MS / 2);   // since 0.8.5
         event(L_("stopp", "Stopp: BIOS-Lüfterkurve %s, Taktbremse bleibt %d MHz, Modell gespeichert"),
               ok ? L_("stopp_ok", "zurück") : L_("stopp_fehler", "NICHT vollständig zurück"), fn & F_TAKT ? sicherMhz : r->capNow);
     } else event(L_("stopp_nurlesen", "Stopp (nur lesen)"));

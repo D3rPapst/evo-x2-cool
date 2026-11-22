@@ -622,7 +622,11 @@ static void paint(HWND w, HDC dc)
         wchar_t tip[4][80];
         swprintf(tip[0], 80, T(L"tip0", L"CPU %.1f °C (geglättet %.1f) · Gehäuse %d °C"), at->tctl, at->tglatt, at->ecT);
         swprintf(tip[1], 80, T(L"tip1", L"Kerne %.1f W · Grafik %.0f W · Chip %.0f W"), at->coreW, at->gpuW, at->pkgW);
-        if (at->fan >= 0) swprintf(tip[2], 80, T(L"tip2", L"Lüfter %d %% %s · %d / %d / %d U/min"), at->fan, grundText(at->grund), at->rpm[0], at->rpm[1], at->rpm[2]);
+        if (at->rpm[2] < 0) {   // system fan not read (SystemluefterLesen=0): only the two CPU fans, no "-1"
+            if (at->fan >= 0) swprintf(tip[2], 80, T(L"tip2c", L"Lüfter %d %% %s · %d / %d U/min"), at->fan, grundText(at->grund), at->rpm[0], at->rpm[1]);
+            else swprintf(tip[2], 80, T(L"tip2d", L"Lüfter BIOS · %d / %d U/min"), at->rpm[0], at->rpm[1]);
+        }
+        else if (at->fan >= 0) swprintf(tip[2], 80, T(L"tip2", L"Lüfter %d %% %s · %d / %d / %d U/min"), at->fan, grundText(at->grund), at->rpm[0], at->rpm[1], at->rpm[2]);
         else swprintf(tip[2], 80, T(L"tip2b", L"Lüfter BIOS · %d / %d / %d U/min"), at->rpm[0], at->rpm[1], at->rpm[2]);
         swprintf(tip[3], 80, T(L"tip3", L"Bremse %d MHz · Kern %.0f MHz · %s"), at->cap, at->mhz, lageText(at->lage));
         int tw2 = 0; SelectObject(dc, fSmall);
